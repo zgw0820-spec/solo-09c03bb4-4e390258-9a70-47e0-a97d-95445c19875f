@@ -34,7 +34,21 @@
         </div>
         <p class="small muted" style="margin:10px 0 0">
           切换仅影响 <b>此后接单</b> 的邮件；已在队列中的请求继续使用接单时的模型版本。
+          每次人工切换都会开启新一轮 <b>观察期</b>。
         </p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>人工复核 · 观察期</h2>
+          <span class="spacer"></span>
+          <span class="small muted" id="obs-thresholds">—</span>
+        </div>
+        <div id="obs-current">
+          <div class="empty">加载中…</div>
+        </div>
+        <div id="obs-rollbacks" style="margin-top:12px"></div>
+        <div id="obs-windows" style="margin-top:12px"></div>
       </div>
 
       <div class="panel">
@@ -107,6 +121,9 @@
             <input type="checkbox" id="auto-refresh" checked /> 自动刷新
           </label>
         </div>
+        <p class="small muted" style="margin:0 0 8px">
+          展开任务后，可对 <b>成功分类</b> 的邮件提交真实类别（垃圾 / 正常）；复核计入该邮件接单时所属的观察期。
+        </p>
         <div id="jobs">
           <div class="empty">尚未提交任何邮件</div>
         </div>

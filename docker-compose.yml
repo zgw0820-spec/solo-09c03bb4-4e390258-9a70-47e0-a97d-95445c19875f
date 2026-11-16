@@ -14,6 +14,11 @@ services:
       BATCH_WAIT_MS: "200"
       DISPATCH_GUARD_MS: "25"
       MAX_EMAILS_PER_SUBMISSION: "16"
+      # Human-review auto-rollback: a manual switch opens an observation
+      # window; >=4 distinct reviewed emails with >=2 spam-judged-as-ham
+      # rolls the active model back to the pre-switch version.
+      ROLLBACK_MIN_REVIEWS: "4"
+      ROLLBACK_MIN_MISSED_SPAM: "2"
       LOG_LEVEL: INFO
     volumes:
       # Two distinct English bag-of-words models are baked into the image and

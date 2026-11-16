@@ -20,6 +20,12 @@ def client():
     main_module.jobs.clear()
     main_module.switches.clear()
     main_module.active_version = main_module.registry.default_version
+    main_module.windows.clear()
+    main_module.windows_by_id.clear()
+    main_module.current_window_id = None
+    main_module.rollbacks.clear()
+    main_module.reviews_by_email.clear()
+    main_module.email_registry.clear()
     main_module.worker.metrics.update(
         {key: 0 for key in main_module.worker.metrics}
     )

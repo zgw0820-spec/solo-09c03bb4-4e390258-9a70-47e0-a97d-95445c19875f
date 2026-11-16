@@ -12,6 +12,10 @@ Verifies, over real HTTP:
 5. deadlines: a slow email times out, its batch-mates still succeed, and the
    late result never flips the timeout back to success
 6. early dispatch when the earliest deadline is near
+7. interleaved demo
+8. human review: observation windows, duplicate/conflict handling, automatic
+   rollback at the missed-spam threshold, and late reviews from an old window
+   never rolling back the current model
 """
 
 from __future__ import annotations
@@ -24,6 +28,9 @@ import httpx
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 SPAM = "Congratulations! You are a winner. Claim your free prize now."
 HAM = "Hi team, attached is the quarterly report for our meeting tomorrow."
+HAM2 = "Can we schedule the sprint review? Thanks, regards."
+HAM3 = "Please review the attached invoice from our vendor and approve the budget."
+HAM4 = "Lunch is booked at noon in the usual place, see you there."
 CRYPTO = "Limited offer! Invest in crypto today and double your money fast."
 
 failures: list[str] = []
@@ -155,6 +162,130 @@ def main() -> int:
     slow = next(e for e in new if e["simulate_latency_ms"] > 0)
     check(slow["status"] == "timeout", "demo slow email timed out")
     check(client.get("/healthz").json()["active_model"] == "v2", "demo left v2 active")
+
+    print("8. human review: observation window + automatic rollback")
+    # The demo above left v2 active; go v1 -> v2 so the window's rollback
+    # target is unambiguously v1.
+    client.post("/api/model", json={"version": "v1"})
+    client.post("/api/model", json={"version": "v2"})
+    obs = client.get("/api/observation").json()
+    current = obs["current"]
+    check(
+        current is not None and current["model_version"] == "v2" and current["previous_version"] == "v1",
+        "manual switch opened an observation window on v2 (rollback target v1)",
+    )
+    window_id = current["id"]
+    review_job = client.post(
+        "/api/classify",
+        json={
+            "label": "review",
+            "emails": [
+                {"text": HAM, "deadline_ms": 900},
+                {"text": HAM2, "deadline_ms": 900},
+                {"text": HAM3, "deadline_ms": 900},
+                {"text": HAM4, "deadline_ms": 900},
+            ],
+        },
+    ).json()
+    check(
+        all(e["status"] == "ok" and e["label"] == "ham" for e in review_job["entries"]),
+        "four review emails classified ok as ham by v2",
+    )
+    check(
+        all(e["window_id"] == window_id for e in review_job["entries"]),
+        "accepted emails pinned to the current observation window",
+    )
+
+    def post_review(index: int, truth: str) -> httpx.Response:
+        return client.post(
+            "/api/reviews",
+            json={"job_id": review_job["id"], "entry_index": index, "true_label": truth},
+        )
+
+    first = post_review(1, "spam").json()
+    check(first["duplicate"] is False and first["review"]["missed_spam"] is True,
+          "first review recorded (spam judged ham = missed)")
+    retry = post_review(1, "spam").json()
+    check(
+        retry["duplicate"] is True and retry["window"]["review_count"] == 1,
+        "same-truth retry not double counted",
+    )
+    conflict = post_review(1, "ham")
+    check(conflict.status_code == 409, "conflicting truth rejected with 409")
+
+    post_review(2, "spam")
+    third = post_review(3, "ham").json()
+    check(
+        third["rollback"] is None and third["window"]["review_count"] == 3,
+        "no rollback below 4 distinct reviews",
+    )
+    fourth = post_review(4, "ham").json()
+    rollback = fourth["rollback"]
+    check(rollback is not None, "4th review with 2 missed spam triggered auto-rollback")
+    if rollback:
+        check(
+            rollback["from"] == "v2" and rollback["to"] == "v1" and rollback["window_id"] == window_id,
+            f"rolled back v2 -> v1 from window #{window_id}",
+        )
+        check(
+            len(rollback["trigger_emails"]) == 2
+            and all(t["true_label"] == "spam" and t["predicted_label"] == "ham" for t in rollback["trigger_emails"]),
+            "rollback record lists the two missed-spam trigger emails",
+        )
+    check(client.get("/healthz").json()["active_model"] == "v1", "active model is now v1")
+    obs = client.get("/api/observation").json()
+    check(obs["current"] is None, "rollback did not open a new observation window")
+    check(
+        obs["windows"] and obs["windows"][0]["status"] == "triggered",
+        "triggered window recorded in history",
+    )
+    check(
+        obs["rollbacks"] and obs["rollbacks"][0]["window_id"] == window_id,
+        "rollback listed in rollback records",
+    )
+
+    print("9. late reviews from an old window cannot roll back the current model")
+    client.post("/api/model", json={"version": "v2"})
+    obs = client.get("/api/observation").json()
+    second_window = obs["current"]["id"]
+    check(second_window != window_id, "re-switching to v2 opened a fresh window")
+    late_job = client.post(
+        "/api/classify",
+        json={
+            "label": "late-reviews",
+            "emails": [
+                {"text": HAM, "deadline_ms": 900},
+                {"text": HAM2, "deadline_ms": 900},
+                {"text": HAM3, "deadline_ms": 900},
+                {"text": HAM4, "deadline_ms": 900},
+            ],
+        },
+    ).json()
+    # Newer manual decision supersedes the window before its reviews arrive.
+    client.post("/api/model", json={"version": "v1"})
+    rollbacks_before = len(client.get("/api/observation").json()["rollbacks"])
+    for index in range(1, 5):
+        late = client.post(
+            "/api/reviews",
+            json={"job_id": late_job["id"], "entry_index": index, "true_label": "spam"},
+        ).json()
+    check(late["review"]["late"] is True, "late review flagged as late")
+    check(late["rollback"] is None, "late review did not trigger a rollback")
+    obs = client.get("/api/observation").json()
+    check(
+        len(obs["rollbacks"]) == rollbacks_before,
+        "no extra rollback recorded for the superseded window",
+    )
+    check(
+        client.get("/healthz").json()["active_model"] == "v1",
+        "current model left untouched by late reviews",
+    )
+    windows = {w["id"]: w for w in obs["windows"]}
+    check(
+        windows.get(second_window, {}).get("status") == "superseded"
+        and windows[second_window]["review_count"] == 4,
+        "superseded window kept its tally but stayed inert",
+    )
 
     print()
     if failures:

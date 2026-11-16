@@ -9,6 +9,7 @@ version they were accepted with.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import time
@@ -17,7 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
@@ -42,6 +43,18 @@ DEADLINE_MIN_MS = 100
 DEADLINE_MAX_MS = 1000
 MAX_JOBS_KEPT = int(os.environ.get("MAX_JOBS_KEPT", "30"))
 
+# Human-review observation windows.  Every *manual* model switch opens a fresh
+# window; when it has accumulated at least ROLLBACK_MIN_REVIEWS distinct
+# reviewed emails, of which at least ROLLBACK_MIN_MISSED_SPAM are spam the
+# model judged as ham, the gateway automatically rolls back to the version
+# that was active before that window's switch.
+ROLLBACK_MIN_REVIEWS = int(os.environ.get("ROLLBACK_MIN_REVIEWS", "4"))
+ROLLBACK_MIN_MISSED_SPAM = int(os.environ.get("ROLLBACK_MIN_MISSED_SPAM", "2"))
+MAX_WINDOWS_KEPT = int(os.environ.get("MAX_WINDOWS_KEPT", "50"))
+MAX_ROLLBACKS_KEPT = int(os.environ.get("MAX_ROLLBACKS_KEPT", "50"))
+MAX_EMAILS_KEPT = int(os.environ.get("MAX_EMAILS_KEPT", "1000"))
+MAX_REVIEWS_KEPT = int(os.environ.get("MAX_REVIEWS_KEPT", "1000"))
+
 registry = ModelRegistry.load_dir(MODELS_DIR, os.environ.get("DEFAULT_MODEL_VERSION"))
 worker = Worker(
     registry,
@@ -53,6 +66,16 @@ worker = Worker(
 active_version: str = registry.default_version
 switches: list[dict[str, Any]] = []
 jobs: dict[str, dict[str, Any]] = {}
+
+# ---- human-review / observation-window state ------------------------------
+windows: list[ObservationWindow] = []
+windows_by_id: dict[int, ObservationWindow] = {}
+current_window_id: int | None = None
+_window_seq = itertools.count(1)
+rollbacks: list[dict[str, Any]] = []
+reviews_by_email: dict[str, Review] = {}
+email_registry: dict[str, EmailRecord] = {}
+
 _background_tasks: set[asyncio.Task] = set()
 
 
@@ -90,6 +113,275 @@ def _set_active(version: str, *, source: str, note: str | None = None) -> dict[s
 
 
 # ---------------------------------------------------------------------------
+# human review: observation windows, reviews, automatic rollback
+# ---------------------------------------------------------------------------
+@dataclass
+class EmailRecord:
+    """Intake snapshot of one accepted email.
+
+    Kept independently of ``jobs`` so a human review can still arrive after
+    the originating job has been pruned from the job list.
+    """
+
+    email_id: str
+    job_id: str
+    entry_index: int
+    text: str
+    model_version: str
+    window_id: int | None
+    accepted_at: str
+    status: str = "accepted"
+    predicted_label: str | None = None
+    score: float | None = None
+
+
+@dataclass
+class Review:
+    """One human ground-truth decision for a successfully classified email."""
+
+    email_id: str
+    job_id: str
+    entry_index: int
+    text: str
+    model_version: str
+    predicted_label: str
+    score: float | None
+    true_label: str
+    window_id: int | None
+    reviewer: str | None
+    note: str | None
+    reviewed_at: str
+    # True when the email's observation window was no longer the current open
+    # one at review time: recorded for transparency, but it can never roll
+    # back the current model.
+    late: bool
+
+    @property
+    def is_missed_spam(self) -> bool:
+        return self.true_label == "spam" and self.predicted_label == "ham"
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "email_id": self.email_id,
+            "job_id": self.job_id,
+            "entry_index": self.entry_index,
+            "text": self.text,
+            "model_version": self.model_version,
+            "predicted_label": self.predicted_label,
+            "score": self.score,
+            "true_label": self.true_label,
+            "window_id": self.window_id,
+            "reviewer": self.reviewer,
+            "note": self.note,
+            "reviewed_at": self.reviewed_at,
+            "late": self.late,
+            "missed_spam": self.is_missed_spam,
+        }
+
+
+@dataclass
+class ObservationWindow:
+    """Reviews accumulated while one manually selected model version is active.
+
+    A window opens on every manual (console/API) model switch — including
+    switching back to a version that was observed before — and counts only
+    distinct emails *accepted* while it is the current window.  It closes
+    either when a newer switch supersedes it or when its own tally triggers
+    an automatic rollback to ``previous_version``.
+    """
+
+    id: int
+    opened_at: str
+    model_version: str
+    previous_version: str | None
+    source: str
+    status: str = "open"  # open | superseded | triggered
+    closed_at: str | None = None
+    reviews: dict[str, Review] = field(default_factory=dict)
+
+    @property
+    def review_count(self) -> int:
+        return len(self.reviews)
+
+    @property
+    def missed_spam_count(self) -> int:
+        return sum(1 for review in self.reviews.values() if review.is_missed_spam)
+
+    def public(self, *, include_reviews: bool = True) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.id,
+            "opened_at": self.opened_at,
+            "closed_at": self.closed_at,
+            "status": self.status,
+            "source": self.source,
+            "model_version": self.model_version,
+            "previous_version": self.previous_version,
+            "review_count": self.review_count,
+            "missed_spam_count": self.missed_spam_count,
+            "progress": {
+                "reviews": self.review_count,
+                "reviews_needed": ROLLBACK_MIN_REVIEWS,
+                "missed_spam": self.missed_spam_count,
+                "missed_spam_needed": ROLLBACK_MIN_MISSED_SPAM,
+            },
+        }
+        if include_reviews:
+            recent = list(self.reviews.values())[-20:][::-1]
+            data["reviews"] = [review.public() for review in recent]
+        return data
+
+
+def _close_current_window(*, status: str) -> None:
+    global current_window_id
+    if current_window_id is None:
+        return
+    window = windows_by_id.get(current_window_id)
+    if window is not None and window.status == "open":
+        window.status = status
+        window.closed_at = _now_iso()
+    current_window_id = None
+
+
+def _prune_windows() -> None:
+    while len(windows) > MAX_WINDOWS_KEPT:
+        evicted = windows.pop(0)
+        windows_by_id.pop(evicted.id, None)
+
+
+def _prune_reviews() -> None:
+    # Window tallies keep their own references, so pruning the global index
+    # only affects the "recent reviews" listing, never rollback accounting.
+    while len(reviews_by_email) > MAX_REVIEWS_KEPT:
+        reviews_by_email.pop(next(iter(reviews_by_email)), None)
+
+
+def _apply_switch(version: str, *, source: str, note: str | None = None) -> dict[str, Any]:
+    """Change the active model and maintain observation windows.
+
+    Any newer switch closes the current window, so a stale window's late
+    reviews can never override a newer (manual or automatic) decision.  Only
+    human-initiated switches (``source="console"``) open a fresh observation
+    window — switching back to a previously observed version therefore starts
+    a brand-new tally instead of resurrecting the old one.
+    """
+    global current_window_id
+    event = _set_active(version, source=source, note=note)
+    _close_current_window(status="superseded")
+    if source == "console":
+        window = ObservationWindow(
+            id=next(_window_seq),
+            opened_at=_now_iso(),
+            model_version=version,
+            previous_version=event["from"],
+            source="manual",
+        )
+        windows.append(window)
+        windows_by_id[window.id] = window
+        current_window_id = window.id
+        _prune_windows()
+        event["window_id"] = window.id
+    return event
+
+
+def _trigger_rollback(window: ObservationWindow) -> dict[str, Any]:
+    """Roll the active model back to the version before ``window``'s switch.
+
+    Only ever called for the *current* open window, so an automatic rollback
+    can never override a newer manual decision.  The rollback itself does not
+    open a new observation window: observation resumes with the next manual
+    switch.  Emails already accepted keep their pinned version; only newly
+    accepted requests use the rolled-back version (intake pinning unchanged).
+    """
+    global current_window_id
+    assert window.previous_version is not None
+    window.status = "triggered"
+    window.closed_at = _now_iso()
+    missed = [review for review in window.reviews.values() if review.is_missed_spam]
+    event = _set_active(
+        window.previous_version,
+        source="auto-rollback",
+        note=(
+            f"观察期 #{window.id}：{window.review_count} 封复核中 "
+            f"{window.missed_spam_count} 封垃圾邮件被判为 ham，自动回退"
+        ),
+    )
+    current_window_id = None
+    rollback = {
+        "at": _now_iso(),
+        "window_id": window.id,
+        "from": event["from"],
+        "to": event["to"],
+        "review_count": window.review_count,
+        "missed_spam_count": window.missed_spam_count,
+        "trigger_emails": [
+            {
+                "email_id": review.email_id,
+                "text": review.text,
+                "model_version": review.model_version,
+                "predicted_label": review.predicted_label,
+                "true_label": review.true_label,
+                "score": review.score,
+            }
+            for review in missed
+        ],
+    }
+    rollbacks.append(rollback)
+    if len(rollbacks) > MAX_ROLLBACKS_KEPT:
+        del rollbacks[: len(rollbacks) - MAX_ROLLBACKS_KEPT]
+    logger.warning(
+        "auto-rollback: observation #%d on %s -> %s (%d reviews, %d missed spam)",
+        window.id,
+        window.model_version,
+        window.previous_version,
+        window.review_count,
+        window.missed_spam_count,
+    )
+    return rollback
+
+
+def _register_email(job: "Job", entry: "JobEntry") -> None:
+    assert entry.email_id is not None
+    email_registry[entry.email_id] = EmailRecord(
+        email_id=entry.email_id,
+        job_id=job.id,
+        entry_index=entry.index,
+        text=entry.text,
+        model_version=entry.model_version or "",
+        window_id=entry.window_id,
+        accepted_at=entry.accepted_at or _now_iso(),
+    )
+    while len(email_registry) > MAX_EMAILS_KEPT:
+        # insertion-ordered dict: evict the oldest record first
+        email_registry.pop(next(iter(email_registry)), None)
+
+
+def _update_email_record(entry: "JobEntry") -> None:
+    if entry.email_id is None or entry.result is None:
+        return
+    record = email_registry.get(entry.email_id)
+    if record is None:
+        return
+    record.status = entry.result.get("status", record.status)
+    record.predicted_label = entry.result.get("label")
+    record.score = entry.result.get("score")
+
+
+def _observation_state() -> dict[str, Any]:
+    current = windows_by_id.get(current_window_id) if current_window_id is not None else None
+    return {
+        "current_window_id": current_window_id,
+        "current": current.public() if current is not None else None,
+        "thresholds": {
+            "min_reviews": ROLLBACK_MIN_REVIEWS,
+            "min_missed_spam": ROLLBACK_MIN_MISSED_SPAM,
+        },
+        "windows": [w.public(include_reviews=False) for w in reversed(windows[-10:])],
+        "rollbacks": list(reversed(rollbacks[-10:])),
+        "recent_reviews": [r.public() for r in list(reviews_by_email.values())[-20:][::-1]],
+    }
+
+
+# ---------------------------------------------------------------------------
 # request models
 # ---------------------------------------------------------------------------
 class EmailIn(BaseModel):
@@ -111,6 +403,14 @@ class SwitchIn(BaseModel):
     note: str | None = Field(default=None, max_length=200)
 
 
+class ReviewIn(BaseModel):
+    job_id: str = Field(min_length=1, max_length=80)
+    entry_index: int = Field(ge=1, le=1000)
+    true_label: Literal["spam", "ham"]
+    reviewer: str | None = Field(default=None, max_length=80)
+    note: str | None = Field(default=None, max_length=200)
+
+
 # ---------------------------------------------------------------------------
 # jobs
 # ---------------------------------------------------------------------------
@@ -121,19 +421,24 @@ class JobEntry:
     deadline_ms: int
     submit_after_ms: int
     simulate_latency_ms: int
+    email_id: str | None = None
     model_version: str | None = None
+    window_id: int | None = None
     accepted_at: str | None = None
     result: dict | None = None
 
     def public(self) -> dict:
         result = self.result or {}
+        review = reviews_by_email.get(self.email_id or "")
         return {
             "index": self.index,
             "text": self.text,
             "deadline_ms": self.deadline_ms,
             "submit_after_ms": self.submit_after_ms,
             "simulate_latency_ms": self.simulate_latency_ms,
+            "email_id": self.email_id,
             "model_version": self.model_version,
+            "window_id": self.window_id,
             "accepted_at": self.accepted_at,
             "status": result.get("status", "accepted"),
             "score": result.get("score"),
@@ -146,6 +451,7 @@ class JobEntry:
             "late_result_discarded": result.get("late_result_discarded", False),
             "submitted_at": result.get("submitted_at"),
             "completed_at": result.get("completed_at"),
+            "review": review.public() if review is not None else None,
         }
 
 
@@ -210,12 +516,15 @@ async def _run_job(job: Job) -> None:
             version = active_version
             entry.model_version = version
             entry.accepted_at = _now_iso()
+            entry.window_id = current_window_id
+            _register_email(job, entry)
             job.events.append(
                 {
                     "at": entry.accepted_at,
                     "type": "accepted",
                     "index": entry.index,
                     "model_version": version,
+                    "window_id": entry.window_id,
                 }
             )
             coro = worker.submit(
@@ -237,6 +546,7 @@ async def _run_job(job: Job) -> None:
                 }
             else:
                 entry.result = result
+            _update_email_record(entry)
         job.status = "completed"
     except asyncio.CancelledError:
         job.status = "cancelled"
@@ -267,6 +577,8 @@ def _new_job(payload: SubmitIn, *, prefix: str = "job") -> Job:
             for i, email in enumerate(payload.emails)
         ],
     )
+    for entry in job.entries:
+        entry.email_id = f"{job.id}:{entry.index}"
     jobs[job.id] = job
     return job
 
@@ -341,8 +653,122 @@ async def switch_model(payload: SwitchIn) -> dict:
             status_code=404,
             detail=f"未知模型版本 {payload.version!r}，可用: {registry.versions}",
         )
-    event = _set_active(payload.version, source="console", note=payload.note)
-    return {"active": active_version, "event": event, "models": registry.versions}
+    # A manual switch closes the previous observation window (superseded) and
+    # opens a fresh one for the newly selected version.
+    event = _apply_switch(payload.version, source="console", note=payload.note)
+    window = windows_by_id.get(current_window_id) if current_window_id is not None else None
+    return {
+        "active": active_version,
+        "event": event,
+        "models": registry.versions,
+        "window": window.public(include_reviews=False) if window is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# human review endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/reviews")
+async def submit_review(payload: ReviewIn) -> dict:
+    """Record the human ground truth for one successfully classified email.
+
+    * The review counts toward the observation window the email was *accepted*
+      in — never toward a newer window.
+    * Re-submitting the same truth for the same email is an idempotent no-op
+      (``duplicate: true``); a different truth is rejected as a conflict.
+    * When the current window reaches the rollback thresholds the active model
+      is rolled back automatically.  Reviews arriving for emails of an
+      already-closed window are marked ``late`` and can never roll back the
+      current model.
+    """
+    email_id = f"{payload.job_id}:{payload.entry_index}"
+    record = email_registry.get(email_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="邮件不存在或已过期，无法复核")
+    if record.status != "ok":
+        raise HTTPException(
+            status_code=409,
+            detail=f"仅成功分类的邮件可提交人工复核（当前状态：{record.status}）",
+        )
+    existing = reviews_by_email.get(email_id)
+    if existing is not None:
+        if existing.true_label == payload.true_label:
+            window = (
+                windows_by_id.get(existing.window_id)
+                if existing.window_id is not None
+                else None
+            )
+            return {
+                "duplicate": True,
+                "detail": "相同真值已记录，未重复计数",
+                "review": existing.public(),
+                "window": window.public() if window is not None else None,
+                "rollback": None,
+                "active_model": active_version,
+            }
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"真值冲突：该邮件已复核为 {existing.true_label}，"
+                f"本次提交为 {payload.true_label}"
+            ),
+        )
+
+    window = (
+        windows_by_id.get(record.window_id) if record.window_id is not None else None
+    )
+    is_current_open = (
+        window is not None
+        and window.status == "open"
+        and window.id == current_window_id
+    )
+    review = Review(
+        email_id=email_id,
+        job_id=record.job_id,
+        entry_index=record.entry_index,
+        text=record.text[:160],
+        model_version=record.model_version,
+        predicted_label=record.predicted_label or "",
+        score=record.score,
+        true_label=payload.true_label,
+        window_id=record.window_id,
+        reviewer=payload.reviewer,
+        note=payload.note,
+        reviewed_at=_now_iso(),
+        late=window is not None and not is_current_open,
+    )
+    reviews_by_email[email_id] = review
+    _prune_reviews()
+
+    rollback_event = None
+    if window is not None:
+        window.reviews[email_id] = review
+        if (
+            is_current_open
+            and window.previous_version is not None
+            and window.review_count >= ROLLBACK_MIN_REVIEWS
+            and window.missed_spam_count >= ROLLBACK_MIN_MISSED_SPAM
+        ):
+            rollback_event = _trigger_rollback(window)
+
+    return {
+        "duplicate": False,
+        "review": review.public(),
+        "window": window.public() if window is not None else None,
+        "rollback": rollback_event,
+        "active_model": active_version,
+    }
+
+
+@app.get("/api/reviews")
+async def list_reviews(limit: int = Query(default=20, ge=1, le=100)) -> dict:
+    reviews = list(reviews_by_email.values())[-limit:][::-1]
+    return {"reviews": [review.public() for review in reviews]}
+
+
+@app.get("/api/observation")
+async def observation() -> dict:
+    return _observation_state()
 
 
 @app.get("/api/state")
@@ -352,6 +778,7 @@ async def state() -> dict:
         "models": registry.versions,
         "switches": list(reversed(switches[-20:])),
         "worker": worker.snapshot(),
+        "observation": _observation_state(),
         "config": {
             "max_batch_size": worker.max_batch_size,
             "batch_wait_ms": worker.batch_wait_s * 1000,
@@ -412,7 +839,7 @@ async def demo_interleaved() -> dict:
     """
     if "v1" not in registry or "v2" not in registry:
         raise HTTPException(status_code=409, detail="demo 需要 v1 与 v2 两个模型")
-    _set_active("v1", source="demo", note="演示开始：先使用 v1")
+    _apply_switch("v1", source="demo", note="演示开始：先使用 v1")
 
     old_emails = [
         EmailIn(
@@ -452,12 +879,15 @@ async def demo_interleaved() -> dict:
                 version = active_version
                 entry.model_version = version
                 entry.accepted_at = _now_iso()
+                entry.window_id = current_window_id
+                _register_email(job, entry)
                 job.events.append(
                     {
                         "at": entry.accepted_at,
                         "type": "accepted",
                         "index": entry.index,
                         "model_version": version,
+                        "window_id": entry.window_id,
                     }
                 )
                 tasks.append(
@@ -473,7 +903,7 @@ async def demo_interleaved() -> dict:
                     )
                 )
             await asyncio.sleep(max(0.0, start + 0.06 - time.monotonic()))
-            event = _set_active(
+            event = _apply_switch(
                 "v2", source="demo", note="演示：切换到 v2（旧请求仍在排队）"
             )
             job.events.append(
@@ -490,12 +920,15 @@ async def demo_interleaved() -> dict:
                 version = active_version
                 entry.model_version = version
                 entry.accepted_at = _now_iso()
+                entry.window_id = current_window_id
+                _register_email(job, entry)
                 job.events.append(
                     {
                         "at": entry.accepted_at,
                         "type": "accepted",
                         "index": entry.index,
                         "model_version": version,
+                        "window_id": entry.window_id,
                     }
                 )
                 tasks.append(
@@ -520,6 +953,7 @@ async def demo_interleaved() -> dict:
                     }
                 else:
                     entry.result = result
+                _update_email_record(entry)
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"

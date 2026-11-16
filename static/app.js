@@ -260,6 +260,7 @@ async function refreshState() {
   }
   state.active = data.active_model;
   updateActiveBadge(data.active_model);
+  renderModels(); // keep the "现行" highlight in sync (e.g. after an auto-rollback)
   const worker = data.worker;
   $("#pending-badge").textContent = `队列 ${worker.pending}`;
   $("#worker-config").textContent =
@@ -268,6 +269,161 @@ async function refreshState() {
   renderMetrics(worker);
   renderVersionMetrics(worker);
   renderBatches(worker.recent_batches);
+  renderObservation(data.observation);
+}
+
+// ---------------------------------------------------------------- observation
+function obsStatusMeta(status) {
+  const map = {
+    open: ["pending", "观察中"],
+    triggered: ["error", "已触发回退"],
+    superseded: ["", "已被新切换取代"],
+  };
+  return map[status] || ["", status || "—"];
+}
+
+function obsMeter(label, value, needed) {
+  const meter = el("div", "obs-meter" + (value >= needed ? " full" : ""));
+  meter.append(el("div", "k", label));
+  meter.append(el("div", "v", `${value} / ${needed}`));
+  const bar = el("div", "bar");
+  const fill = el("i");
+  fill.style.width = `${Math.min(100, needed > 0 ? (value / needed) * 100 : 0)}%`;
+  bar.append(fill);
+  meter.append(bar);
+  return meter;
+}
+
+function obsReviewRow(review) {
+  const row = el("div", "obs-row");
+  row.append(
+    el("span", "pill " + (review.true_label === "spam" ? "timeout" : "ok"), `真值 ${review.true_label}`)
+  );
+  row.append(el("span", "small muted", `判定 ${review.predicted_label}`));
+  if (review.missed_spam) row.append(el("span", "pill error", "漏判"));
+  else if (review.true_label !== review.predicted_label)
+    row.append(el("span", "pill error", "误报"));
+  if (review.late) row.append(el("span", "small muted", "迟到·不计回退"));
+  const text = el("span", "small muted clamp-inline", review.text);
+  text.title = review.text;
+  row.append(text);
+  return row;
+}
+
+function rollbackCard(rollback) {
+  const card = el("div", "rollback-card");
+  const head = el("div", "obs-head");
+  head.append(el("span", "pill error", "自动回退"));
+  head.append(el("span", "mono small", `${rollback.from} → ${rollback.to}`));
+  head.append(el("span", "small muted", `观察期 #${rollback.window_id}`));
+  head.append(el("span", "spacer"));
+  head.append(el("span", "small muted mono", (rollback.at || "").slice(11, 19)));
+  card.append(head);
+  card.append(
+    el(
+      "div",
+      "small muted",
+      `复核 ${rollback.review_count} 封 · 垃圾邮件被判 ham ${rollback.missed_spam_count} 封，触发邮件：`
+    )
+  );
+  const triggers = el("div", "trigger-list");
+  for (const mail of rollback.trigger_emails || []) {
+    const item = el("div", "trigger-mail");
+    item.append(
+      el("span", "pill timeout", `真值 ${mail.true_label} · 判为 ${mail.predicted_label}`)
+    );
+    const text = el("span", "small", mail.text);
+    text.title = `${mail.email_id} · ${mail.text}`;
+    item.append(text);
+    triggers.append(item);
+  }
+  card.append(triggers);
+  return card;
+}
+
+function renderObservation(obs) {
+  if (!obs) return;
+  const thresholds = obs.thresholds || {};
+  $("#obs-thresholds").textContent =
+    `复核 ≥${thresholds.min_reviews} 且漏判 ≥${thresholds.min_missed_spam} ⇒ 自动回退`;
+
+  const currentBox = $("#obs-current");
+  currentBox.textContent = "";
+  if (!obs.current) {
+    currentBox.append(
+      el("div", "empty", "当前无开启的观察期 — 人工切换模型后开启新一轮观察；自动回退后亦然。")
+    );
+  } else {
+    const w = obs.current;
+    const card = el("div", "obs-card");
+    const head = el("div", "obs-head");
+    head.append(el("span", "pill pending", `观察期 #${w.id}`));
+    head.append(versionPill(w.model_version));
+    head.append(el("span", "small muted", `回退目标 ${w.previous_version ?? "—"}`));
+    head.append(el("span", "spacer"));
+    head.append(el("span", "small muted mono", (w.opened_at || "").slice(11, 19)));
+    card.append(head);
+    const progress = el("div", "obs-progress");
+    progress.append(obsMeter("复核（不同邮件）", w.review_count, thresholds.min_reviews));
+    progress.append(obsMeter("漏判（垃圾→ham）", w.missed_spam_count, thresholds.min_missed_spam));
+    card.append(progress);
+    if (w.reviews && w.reviews.length) {
+      const list = el("div", "obs-reviews");
+      for (const review of w.reviews.slice(0, 6)) list.append(obsReviewRow(review));
+      card.append(list);
+    }
+    currentBox.append(card);
+  }
+
+  const rollbackBox = $("#obs-rollbacks");
+  rollbackBox.textContent = "";
+  rollbackBox.append(el("h3", null, "回退记录"));
+  if (!obs.rollbacks || !obs.rollbacks.length) {
+    rollbackBox.append(el("div", "empty", "尚无自动回退"));
+  } else {
+    for (const rollback of obs.rollbacks) rollbackBox.append(rollbackCard(rollback));
+  }
+
+  const windowBox = $("#obs-windows");
+  windowBox.textContent = "";
+  windowBox.append(el("h3", null, "观察期历史"));
+  if (!obs.windows || !obs.windows.length) {
+    windowBox.append(el("div", "empty", "尚无观察期"));
+  } else {
+    const list = el("div", "obs-history");
+    for (const w of obs.windows) {
+      const [cls, label] = obsStatusMeta(w.status);
+      const row = el("div", "obs-row");
+      row.append(el("span", `pill ${cls}`.trim(), `#${w.id} ${label}`));
+      row.append(versionPill(w.model_version));
+      row.append(el("span", "small muted", `目标 ${w.previous_version ?? "—"}`));
+      row.append(el("span", "small muted", `复核 ${w.review_count} · 漏判 ${w.missed_spam_count}`));
+      list.append(row);
+    }
+    windowBox.append(list);
+  }
+}
+
+async function submitReview(jobId, entryIndex, trueLabel) {
+  try {
+    const data = await api("/api/reviews", {
+      method: "POST",
+      body: JSON.stringify({ job_id: jobId, entry_index: entryIndex, true_label: trueLabel }),
+    });
+    if (data.rollback) {
+      toast(
+        `观察期 #${data.rollback.window_id} 触发自动回退：${data.rollback.from} → ${data.rollback.to}`
+      );
+    } else if (data.duplicate) {
+      toast("相同真值已记录，未重复计数");
+    } else {
+      toast(`已记录人工复核：真值 ${trueLabel}`);
+    }
+    await refreshState();
+    await refreshJobs(true);
+  } catch (error) {
+    toast(`复核失败：${error.message}`, true);
+  }
 }
 
 function renderMetrics(worker) {
@@ -396,6 +552,7 @@ function buildJobCard(job) {
     "批次",
     "延迟",
     "说明",
+    "复核",
   ]) {
     headRow.append(el("th", null, title));
   }
@@ -407,7 +564,7 @@ function buildJobCard(job) {
   if (!entries.length) {
     const tr = el("tr");
     const td = el("td", "empty", "结果加载中…");
-    td.colSpan = 10;
+    td.colSpan = 11;
     tr.append(td);
     tbody.append(tr);
   }
@@ -444,8 +601,40 @@ function buildJobCard(job) {
     if (entry.late_result_discarded) notes.push("迟到结果已丢弃");
     if (entry.simulate_latency_ms) notes.push(`模拟延迟 ${entry.simulate_latency_ms}ms`);
     if (entry.submit_after_ms) notes.push(`错峰 ${entry.submit_after_ms}ms`);
+    if (entry.window_id !== null && entry.window_id !== undefined)
+      notes.push(`观察期 #${entry.window_id}`);
     noteCell.textContent = notes.join(" · ") || "—";
     tr.append(noteCell);
+    const reviewCell = el("td", "review-cell");
+    if (entry.status === "ok") {
+      if (entry.review) {
+        const review = entry.review;
+        reviewCell.append(
+          el(
+            "span",
+            "pill " + (review.true_label === "spam" ? "timeout" : "ok"),
+            `真值 ${review.true_label}`
+          )
+        );
+        if (review.true_label !== entry.label) {
+          reviewCell.append(
+            el("span", "pill error", review.true_label === "spam" ? "漏判" : "误报")
+          );
+        }
+        if (review.late) reviewCell.append(el("span", "small muted", "迟到"));
+      } else {
+        const spamBtn = el("button", "tiny", "垃圾");
+        spamBtn.title = "人工复核：真实类别为垃圾邮件";
+        spamBtn.onclick = () => submitReview(job.id, entry.index, "spam");
+        const hamBtn = el("button", "tiny ghost", "正常");
+        hamBtn.title = "人工复核：真实类别为正常邮件";
+        hamBtn.onclick = () => submitReview(job.id, entry.index, "ham");
+        reviewCell.append(spamBtn, hamBtn);
+      }
+    } else {
+      reviewCell.append(el("span", "muted small", "—"));
+    }
+    tr.append(reviewCell);
     tbody.append(tr);
   }
   table.append(tbody);
